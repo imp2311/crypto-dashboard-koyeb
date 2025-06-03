@@ -2,5 +2,5 @@ dash
 plotly
 pandas
 ccxt
+pandas_ta
 yfinance
-TA-Lib

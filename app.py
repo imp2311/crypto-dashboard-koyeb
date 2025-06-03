@@ -1,6 +1,6 @@
 import ccxt
-import talib
 import pandas as pd
+import pandas_ta as ta
 import yfinance as yf
 from dash import Dash, dcc, html
 from dash.dependencies import Input, Output
@@ -16,12 +16,12 @@ def get_indicators(symbol):
         ohlcv = exchange.fetch_ohlcv(symbol, timeframe=TIMEFRAME, limit=200)
         df = pd.DataFrame(ohlcv, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
         df['timestamp'] = pd.to_datetime(df['timestamp'], unit='ms')
-        df['RSI'] = talib.RSI(df['close'], timeperiod=14)
-        macd, macdsignal, _ = talib.MACD(df['close'], fastperiod=12, slowperiod=26, signalperiod=9)
-        df['MACD'] = macd
-        df['MACD_SIGNAL'] = macdsignal
-        df['EMA50'] = talib.EMA(df['close'], timeperiod=50)
-        df['EMA200'] = talib.EMA(df['close'], timeperiod=200)
+        df['RSI'] = ta.rsi(df['close'], length=14)
+        macd = ta.macd(df['close'])
+        df['MACD'] = macd['MACD_12_26_9']
+        df['MACD_SIGNAL'] = macd['MACDs_12_26_9']
+        df['EMA50'] = ta.ema(df['close'], length=50)
+        df['EMA200'] = ta.ema(df['close'], length=200)
         return df
     except Exception as e:
         print(f"Errore con {symbol}: {e}")
@@ -37,7 +37,8 @@ def get_btc_dominance():
         return "N/A"
 
 app = Dash(__name__)
-server = app.server
+server = app.server  # NECESSARIO per Koyeb
+
 app.title = "Altcoin Trend Analyzer"
 
 app.layout = html.Div([
@@ -78,7 +79,6 @@ def update_signals(n):
 
             trend = f"{symbol}:"
 
-            # RSI
             if rsi > 70:
                 trend += f" 🔴 RSI {rsi:.1f} (Overbought)"
             elif rsi < 30:
@@ -86,13 +86,11 @@ def update_signals(n):
             else:
                 trend += f" ⚪ RSI {rsi:.1f}"
 
-            # MACD
             if macd > signal:
                 trend += f" | 🟢 MACD Bullish"
             elif macd < signal:
                 trend += f" | 🔴 MACD Bearish"
 
-            # EMA
             if ema50 > ema200:
                 trend += f" | 📈 EMA Bullish (50 > 200)"
             else:

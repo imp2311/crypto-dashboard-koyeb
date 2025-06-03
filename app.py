@@ -1,6 +1,6 @@
 import ccxt
 import pandas as pd
-import yfinance as yf
+import requests
 from dash import Dash, dcc, html
 from dash.dependencies import Input, Output
 import plotly.graph_objs as go
@@ -13,51 +13,47 @@ exchange = ccxt.binance()
 def get_indicators(symbol):
     try:
         ohlcv = exchange.fetch_ohlcv(symbol, timeframe=TIMEFRAME, limit=200)
-        if not ohlcv:
-            print(f"Nessun dato OHLCV per {symbol}")
-            return None
         df = pd.DataFrame(ohlcv, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
         df['timestamp'] = pd.to_datetime(df['timestamp'], unit='ms')
 
-        # Calcola indicatori solo se dati sufficienti
-        if len(df) < 200:
-            print(f"Dati insufficienti per {symbol}")
-            return None
+        # Calcolo indicatori senza ta-lib: RSI, MACD, EMA
+        # Per esempio, calcoliamo RSI manualmente
+        delta = df['close'].diff()
+        gain = delta.where(delta > 0, 0)
+        loss = -delta.where(delta < 0, 0)
+        avg_gain = gain.rolling(14).mean()
+        avg_loss = loss.rolling(14).mean()
+        rs = avg_gain / avg_loss
+        df['RSI'] = 100 - (100 / (1 + rs))
 
-        # Calcolo indicatori, gestendo eccezioni
-        try:
-            import talib
-            df['RSI'] = talib.RSI(df['close'], timeperiod=14)
-            macd, macdsignal, _ = talib.MACD(df['close'], fastperiod=12, slowperiod=26, signalperiod=9)
-            df['MACD'] = macd
-            df['MACD_SIGNAL'] = macdsignal
-            df['EMA50'] = talib.EMA(df['close'], timeperiod=50)
-            df['EMA200'] = talib.EMA(df['close'], timeperiod=200)
-        except Exception as e:
-            print(f"Errore calcolo indicatori TA-Lib per {symbol}: {e}")
-            return None
+        # MACD
+        ema12 = df['close'].ewm(span=12, adjust=False).mean()
+        ema26 = df['close'].ewm(span=26, adjust=False).mean()
+        df['MACD'] = ema12 - ema26
+        df['MACD_SIGNAL'] = df['MACD'].ewm(span=9, adjust=False).mean()
+
+        # EMA 50 e 200
+        df['EMA50'] = df['close'].ewm(span=50, adjust=False).mean()
+        df['EMA200'] = df['close'].ewm(span=200, adjust=False).mean()
 
         return df
-
     except Exception as e:
-        print(f"Errore fetch dati per {symbol}: {e}")
+        print(f"Errore con {symbol}: {e}")
         return None
 
 def get_btc_dominance():
     try:
-        data = yf.download("^BTC.D", period="1d", interval="1h")
-        if data.empty:
-            print("Dati dominance BTC vuoti")
-            return "N/A"
-        latest = data['Close'].iloc[-1]
-        return round(latest, 2)
+        url = "https://api.coingecko.com/api/v3/global"
+        response = requests.get(url)
+        data = response.json()
+        dominance = data['data']['market_cap_percentage']['btc']
+        return round(dominance, 2)
     except Exception as e:
         print(f"Errore Dominance BTC: {e}")
         return "N/A"
 
 app = Dash(__name__)
 app.title = "Altcoin Trend Analyzer"
-app.server = app.server  # Esposizione server Flask
 
 app.layout = html.Div([
     html.H2("📈 Altcoin Trend Dashboard"),
@@ -86,16 +82,8 @@ def update_signals(n):
     signals = []
     for symbol in SYMBOLS:
         df = get_indicators(symbol)
-        if df is None or df.empty:
-            signals.append(html.Div(f"{symbol}: dati non disponibili", style={'color': 'red', 'marginBottom': '10px'}))
-            continue
-
-        latest = df.iloc[-1]
-        if latest.isnull().any():
-            signals.append(html.Div(f"{symbol}: dati incompleti", style={'color': 'orange', 'marginBottom': '10px'}))
-            continue
-
-        try:
+        if df is not None and not df.empty:
+            latest = df.iloc[-1]
             rsi = latest['RSI']
             macd = latest['MACD']
             signal = latest['MACD_SIGNAL']
@@ -125,8 +113,8 @@ def update_signals(n):
                 trend += f" | 📉 EMA Bearish (50 < 200)"
 
             signals.append(html.Div(trend, style={'marginBottom': '10px'}))
-        except Exception as e:
-            signals.append(html.Div(f"{symbol}: errore nel calcolo indicatori - {e}", style={'color': 'red', 'marginBottom': '10px'}))
+        else:
+            signals.append(html.Div(f"{symbol}: Dati non disponibili", style={'marginBottom': '10px', 'color': 'red'}))
     return signals
 
 @app.callback(
@@ -137,11 +125,6 @@ def update_graph(symbol):
     df = get_indicators(symbol)
     if df is None or df.empty:
         return go.Figure()
-
-    if df[['RSI', 'MACD', 'MACD_SIGNAL', 'EMA50', 'EMA200']].isnull().values.any():
-        # Se ci sono valori nulli evita di disegnare
-        return go.Figure()
-
     fig = go.Figure()
     fig.add_trace(go.Scatter(x=df['timestamp'], y=df['RSI'], name='RSI'))
     fig.add_trace(go.Scatter(x=df['timestamp'], y=df['MACD'], name='MACD'))
@@ -152,4 +135,5 @@ def update_graph(symbol):
     return fig
 
 if __name__ == '__main__':
+    # In base alla tua versione Dash, usa app.run() invece di app.run_server()
     app.run(debug=True, host='0.0.0.0', port=8080)

@@ -1,9 +1,14 @@
 import ccxt
 import pandas as pd
-import requests
+import numpy as np
+import yfinance as yf
 from dash import Dash, dcc, html
 from dash.dependencies import Input, Output
 import plotly.graph_objs as go
+import logging
+
+# Setup log
+logging.basicConfig(level=logging.INFO)
 
 SYMBOLS = ['ETH/USDT', 'BNB/USDT', 'ADA/USDT', 'SOL/USDT', 'XRP/USDT']
 TIMEFRAME = '1h'
@@ -12,48 +17,49 @@ exchange = ccxt.binance()
 
 def get_indicators(symbol):
     try:
+        logging.info(f"Fetching data for {symbol}")
         ohlcv = exchange.fetch_ohlcv(symbol, timeframe=TIMEFRAME, limit=200)
         df = pd.DataFrame(ohlcv, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
         df['timestamp'] = pd.to_datetime(df['timestamp'], unit='ms')
-
-        # Calcolo indicatori senza ta-lib: RSI, MACD, EMA
-        # Per esempio, calcoliamo RSI manualmente
-        delta = df['close'].diff()
-        gain = delta.where(delta > 0, 0)
-        loss = -delta.where(delta < 0, 0)
-        avg_gain = gain.rolling(14).mean()
-        avg_loss = loss.rolling(14).mean()
-        rs = avg_gain / avg_loss
-        df['RSI'] = 100 - (100 / (1 + rs))
-
-        # MACD
-        ema12 = df['close'].ewm(span=12, adjust=False).mean()
-        ema26 = df['close'].ewm(span=26, adjust=False).mean()
-        df['MACD'] = ema12 - ema26
-        df['MACD_SIGNAL'] = df['MACD'].ewm(span=9, adjust=False).mean()
-
-        # EMA 50 e 200
-        df['EMA50'] = df['close'].ewm(span=50, adjust=False).mean()
-        df['EMA200'] = df['close'].ewm(span=200, adjust=False).mean()
-
+        df['RSI'] = ta_rsi(df['close'], 14)
+        df['MACD'], df['MACD_SIGNAL'] = ta_macd(df['close'])
+        df['EMA50'] = ta_ema(df['close'], 50)
+        df['EMA200'] = ta_ema(df['close'], 200)
         return df
     except Exception as e:
-        print(f"Errore con {symbol}: {e}")
+        logging.error(f"Errore con {symbol}: {e}")
         return None
+
+def ta_rsi(series, period=14):
+    delta = series.diff()
+    gain = delta.clip(lower=0).rolling(window=period).mean()
+    loss = -delta.clip(upper=0).rolling(window=period).mean()
+    rs = gain / loss
+    return 100 - (100 / (1 + rs))
+
+def ta_macd(series, fast=12, slow=26, signal=9):
+    fast_ema = series.ewm(span=fast).mean()
+    slow_ema = series.ewm(span=slow).mean()
+    macd = fast_ema - slow_ema
+    signal_line = macd.ewm(span=signal).mean()
+    return macd, signal_line
+
+def ta_ema(series, period):
+    return series.ewm(span=period).mean()
 
 def get_btc_dominance():
     try:
-        url = "https://api.coingecko.com/api/v3/global"
-        response = requests.get(url)
-        data = response.json()
-        dominance = data['data']['market_cap_percentage']['btc']
-        return round(dominance, 2)
+        data = yf.download("^BTC.D", period="1d", interval="1h")
+        if data.empty:
+            return "N/A"
+        return round(data['Close'].iloc[-1], 2)
     except Exception as e:
-        print(f"Errore Dominance BTC: {e}")
+        logging.error(f"Errore Dominance BTC: {e}")
         return "N/A"
 
+# --- DASH APP ---
 app = Dash(__name__)
-app.title = "Altcoin Trend Analyzer"
+server = app.server  # WSGI for Koyeb
 
 app.layout = html.Div([
     html.H2("📈 Altcoin Trend Dashboard"),
@@ -80,9 +86,13 @@ def update_dominance(n):
 )
 def update_signals(n):
     signals = []
-    for symbol in SYMBOLS:
-        df = get_indicators(symbol)
-        if df is not None and not df.empty:
+    try:
+        for symbol in SYMBOLS:
+            df = get_indicators(symbol)
+            if df is None or df.empty:
+                signals.append(html.Div(f"No data for {symbol}", style={'color': 'red'}))
+                continue
+            
             latest = df.iloc[-1]
             rsi = latest['RSI']
             macd = latest['MACD']
@@ -101,20 +111,15 @@ def update_signals(n):
                 trend += f" ⚪ RSI {rsi:.1f}"
 
             # MACD
-            if macd > signal:
-                trend += f" | 🟢 MACD Bullish"
-            elif macd < signal:
-                trend += f" | 🔴 MACD Bearish"
+            trend += f" | {'🟢 MACD Bullish' if macd > signal else '🔴 MACD Bearish'}"
 
             # EMA
-            if ema50 > ema200:
-                trend += f" | 📈 EMA Bullish (50 > 200)"
-            else:
-                trend += f" | 📉 EMA Bearish (50 < 200)"
+            trend += f" | {'📈 EMA Bullish (50 > 200)' if ema50 > ema200 else '📉 EMA Bearish (50 < 200)'}"
 
             signals.append(html.Div(trend, style={'marginBottom': '10px'}))
-        else:
-            signals.append(html.Div(f"{symbol}: Dati non disponibili", style={'marginBottom': '10px', 'color': 'red'}))
+    except Exception as e:
+        logging.error(f"Errore callback signals: {e}")
+        signals.append(html.Div(f"Errore: {str(e)}", style={'color': 'red'}))
     return signals
 
 @app.callback(
@@ -122,18 +127,21 @@ def update_signals(n):
     Input('tabs', 'value')
 )
 def update_graph(symbol):
-    df = get_indicators(symbol)
-    if df is None or df.empty:
-        return go.Figure()
-    fig = go.Figure()
-    fig.add_trace(go.Scatter(x=df['timestamp'], y=df['RSI'], name='RSI'))
-    fig.add_trace(go.Scatter(x=df['timestamp'], y=df['MACD'], name='MACD'))
-    fig.add_trace(go.Scatter(x=df['timestamp'], y=df['MACD_SIGNAL'], name='MACD Signal'))
-    fig.add_trace(go.Scatter(x=df['timestamp'], y=df['EMA50'], name='EMA 50', line=dict(dash='dot')))
-    fig.add_trace(go.Scatter(x=df['timestamp'], y=df['EMA200'], name='EMA 200', line=dict(dash='dot')))
-    fig.update_layout(title=f"📊 Indicatori per {symbol}", yaxis_title="Valori", xaxis_title="Ora")
-    return fig
+    try:
+        df = get_indicators(symbol)
+        if df is None or df.empty:
+            return go.Figure(layout={'title': f"Nessun dato disponibile per {symbol}"})
+        fig = go.Figure()
+        fig.add_trace(go.Scatter(x=df['timestamp'], y=df['RSI'], name='RSI'))
+        fig.add_trace(go.Scatter(x=df['timestamp'], y=df['MACD'], name='MACD'))
+        fig.add_trace(go.Scatter(x=df['timestamp'], y=df['MACD_SIGNAL'], name='MACD Signal'))
+        fig.add_trace(go.Scatter(x=df['timestamp'], y=df['EMA50'], name='EMA 50', line=dict(dash='dot')))
+        fig.add_trace(go.Scatter(x=df['timestamp'], y=df['EMA200'], name='EMA 200', line=dict(dash='dot')))
+        fig.update_layout(title=f"📊 Indicatori per {symbol}", yaxis_title="Valori", xaxis_title="Ora")
+        return fig
+    except Exception as e:
+        logging.error(f"Errore callback grafico: {e}")
+        return go.Figure(layout={'title': f"Errore: {str(e)}"})
 
 if __name__ == '__main__':
-    # In base alla tua versione Dash, usa app.run() invece di app.run_server()
     app.run(debug=True, host='0.0.0.0', port=8080)

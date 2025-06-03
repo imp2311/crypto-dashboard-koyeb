@@ -1,6 +1,5 @@
 import ccxt
 import pandas as pd
-import pandas_ta as ta
 import yfinance as yf
 from dash import Dash, dcc, html
 from dash.dependencies import Input, Output
@@ -14,22 +13,42 @@ exchange = ccxt.binance()
 def get_indicators(symbol):
     try:
         ohlcv = exchange.fetch_ohlcv(symbol, timeframe=TIMEFRAME, limit=200)
+        if not ohlcv:
+            print(f"Nessun dato OHLCV per {symbol}")
+            return None
         df = pd.DataFrame(ohlcv, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
         df['timestamp'] = pd.to_datetime(df['timestamp'], unit='ms')
-        df['RSI'] = ta.rsi(df['close'], length=14)
-        macd = ta.macd(df['close'])
-        df['MACD'] = macd['MACD_12_26_9']
-        df['MACD_SIGNAL'] = macd['MACDs_12_26_9']
-        df['EMA50'] = ta.ema(df['close'], length=50)
-        df['EMA200'] = ta.ema(df['close'], length=200)
+
+        # Calcola indicatori solo se dati sufficienti
+        if len(df) < 200:
+            print(f"Dati insufficienti per {symbol}")
+            return None
+
+        # Calcolo indicatori, gestendo eccezioni
+        try:
+            import talib
+            df['RSI'] = talib.RSI(df['close'], timeperiod=14)
+            macd, macdsignal, _ = talib.MACD(df['close'], fastperiod=12, slowperiod=26, signalperiod=9)
+            df['MACD'] = macd
+            df['MACD_SIGNAL'] = macdsignal
+            df['EMA50'] = talib.EMA(df['close'], timeperiod=50)
+            df['EMA200'] = talib.EMA(df['close'], timeperiod=200)
+        except Exception as e:
+            print(f"Errore calcolo indicatori TA-Lib per {symbol}: {e}")
+            return None
+
         return df
+
     except Exception as e:
-        print(f"Errore con {symbol}: {e}")
+        print(f"Errore fetch dati per {symbol}: {e}")
         return None
 
 def get_btc_dominance():
     try:
         data = yf.download("^BTC.D", period="1d", interval="1h")
+        if data.empty:
+            print("Dati dominance BTC vuoti")
+            return "N/A"
         latest = data['Close'].iloc[-1]
         return round(latest, 2)
     except Exception as e:
@@ -37,9 +56,8 @@ def get_btc_dominance():
         return "N/A"
 
 app = Dash(__name__)
-server = app.server  # NECESSARIO per Koyeb
-
 app.title = "Altcoin Trend Analyzer"
+app.server = app.server  # Esposizione server Flask
 
 app.layout = html.Div([
     html.H2("📈 Altcoin Trend Dashboard"),
@@ -68,17 +86,25 @@ def update_signals(n):
     signals = []
     for symbol in SYMBOLS:
         df = get_indicators(symbol)
-        if df is not None:
-            latest = df.iloc[-1]
+        if df is None or df.empty:
+            signals.append(html.Div(f"{symbol}: dati non disponibili", style={'color': 'red', 'marginBottom': '10px'}))
+            continue
+
+        latest = df.iloc[-1]
+        if latest.isnull().any():
+            signals.append(html.Div(f"{symbol}: dati incompleti", style={'color': 'orange', 'marginBottom': '10px'}))
+            continue
+
+        try:
             rsi = latest['RSI']
             macd = latest['MACD']
             signal = latest['MACD_SIGNAL']
             ema50 = latest['EMA50']
             ema200 = latest['EMA200']
-            close = latest['close']
 
             trend = f"{symbol}:"
 
+            # RSI
             if rsi > 70:
                 trend += f" 🔴 RSI {rsi:.1f} (Overbought)"
             elif rsi < 30:
@@ -86,17 +112,21 @@ def update_signals(n):
             else:
                 trend += f" ⚪ RSI {rsi:.1f}"
 
+            # MACD
             if macd > signal:
                 trend += f" | 🟢 MACD Bullish"
             elif macd < signal:
                 trend += f" | 🔴 MACD Bearish"
 
+            # EMA
             if ema50 > ema200:
                 trend += f" | 📈 EMA Bullish (50 > 200)"
             else:
                 trend += f" | 📉 EMA Bearish (50 < 200)"
 
             signals.append(html.Div(trend, style={'marginBottom': '10px'}))
+        except Exception as e:
+            signals.append(html.Div(f"{symbol}: errore nel calcolo indicatori - {e}", style={'color': 'red', 'marginBottom': '10px'}))
     return signals
 
 @app.callback(
@@ -105,8 +135,13 @@ def update_signals(n):
 )
 def update_graph(symbol):
     df = get_indicators(symbol)
-    if df is None:
+    if df is None or df.empty:
         return go.Figure()
+
+    if df[['RSI', 'MACD', 'MACD_SIGNAL', 'EMA50', 'EMA200']].isnull().values.any():
+        # Se ci sono valori nulli evita di disegnare
+        return go.Figure()
+
     fig = go.Figure()
     fig.add_trace(go.Scatter(x=df['timestamp'], y=df['RSI'], name='RSI'))
     fig.add_trace(go.Scatter(x=df['timestamp'], y=df['MACD'], name='MACD'))
@@ -118,5 +153,3 @@ def update_graph(symbol):
 
 if __name__ == '__main__':
     app.run(debug=True, host='0.0.0.0', port=8080)
-
-

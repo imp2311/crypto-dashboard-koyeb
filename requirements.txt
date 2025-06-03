@@ -1,6 +1,6 @@
 dash
-ccxt
-pandas
-pandas_ta
-yfinance
 plotly
+pandas
+ccxt
+yfinance
+TA-Lib

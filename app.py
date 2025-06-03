@@ -37,6 +37,7 @@ def get_btc_dominance():
         return "N/A"
 
 app = Dash(__name__)
+server = app.server
 app.title = "Altcoin Trend Analyzer"
 
 app.layout = html.Div([
@@ -118,4 +119,4 @@ def update_graph(symbol):
     return fig
 
 if __name__ == '__main__':
-    app.run_server(debug=True)
+    app.run_server(debug=True, host='0.0.0.0', port=8080)

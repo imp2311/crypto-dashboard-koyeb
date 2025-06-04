@@ -1,188 +1,144 @@
-import ccxt
+import os
 import pandas as pd
-from dash import Dash, html, dcc, Input, Output, State
-import plotly.graph_objs as go
-import base64
+import dash
+from dash import dcc, html, Input, Output, State, callback_context, dash_table
+import dash_bootstrap_components as dbc
 import logging
 
-# === CONFIG ===
-EXCEL_FILE = 'data/assets.xlsx'
-TIMEFRAME = '1h'
-exchange = ccxt.binance()
-logging.basicConfig(level=logging.INFO)
+EXCEL_FILE = "data/assets.xlsx"
 
-# === DASH INIT ===
-app = Dash(__name__)
-app.title = "📊 Altcoin Signal Dashboard"
+# Assicura che la cartella esista
+os.makedirs("data", exist_ok=True)
 
-# === LOAD EXCEL ===
+# Funzione per caricare dati da Excel
 def load_assets():
     try:
         df = pd.read_excel(EXCEL_FILE)
-        df = df.dropna(subset=['Symbol'])
-        df['Valore'] = df['Valore'].astype(float)
-
-        liqu_usdt = df['Liquidità_USDT'].iloc[0] if 'Liquidità_USDT' in df.columns else None
-        liqu_aed = df['Liquidità_AED'].iloc[0] if 'Liquidità_AED' in df.columns else None
-
-        return df, liqu_usdt, liqu_aed
-    except Exception as e:
-        logging.error(f"Errore nel file Excel: {e}")
-        return pd.DataFrame(columns=['Symbol', 'Valore']), None, None
-
-# === INDICATORS ===
-def get_indicators(symbol):
-    try:
-        ohlcv = exchange.fetch_ohlcv(symbol, timeframe=TIMEFRAME, limit=200)
-        df = pd.DataFrame(ohlcv, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
-        df['close'] = df['close'].astype(float)
-
-        delta = df['close'].diff()
-        gain = delta.clip(lower=0)
-        loss = -delta.clip(upper=0)
-        avg_gain = gain.rolling(14).mean()
-        avg_loss = loss.rolling(14).mean()
-        rs = avg_gain / avg_loss
-        df['RSI'] = 100 - (100 / (1 + rs))
-
-        ema12 = df['close'].ewm(span=12).mean()
-        ema26 = df['close'].ewm(span=26).mean()
-        df['MACD'] = ema12 - ema26
-        df['MACD_SIGNAL'] = df['MACD'].ewm(span=9).mean()
-
-        df['EMA50'] = df['close'].ewm(span=50).mean()
-        df['EMA200'] = df['close'].ewm(span=200).mean()
-
+        # Controlla colonne essenziali
+        expected_cols = {'Symbol', 'Valore', 'Liquidità_USDT', 'Liquidità_AED'}
+        if not expected_cols.issubset(set(df.columns)):
+            logging.error(f"Colonne mancanti in {EXCEL_FILE}, aspettate: {expected_cols}")
+            return pd.DataFrame()
         return df
     except Exception as e:
-        logging.warning(f"{symbol} non disponibile: {e}")
-        return None
+        logging.error(f"Errore nel file Excel: {e}")
+        return pd.DataFrame()
 
-def generate_signal(df):
-    if df is None or df.empty:
-        return "NO DATA", None
-    latest = df.iloc[-1]
-    rsi = latest['RSI']
-    macd = latest['MACD']
-    signal = latest['MACD_SIGNAL']
-    ema50 = latest['EMA50']
-    ema200 = latest['EMA200']
+# Funzione semplice di esempio per segnale buy/sell/hold basata su valore investito
+def signal_from_valore(val):
+    if pd.isna(val):
+        return "No Data"
+    if val > 50000:
+        return "SELL"
+    elif val > 10000:
+        return "HOLD"
+    else:
+        return "BUY"
 
-    decision = "NEUTRAL"
-    if rsi < 30 and macd > signal and ema50 > ema200:
-        decision = "BUY"
-    elif rsi > 70 and macd < signal and ema50 < ema200:
-        decision = "SELL"
+app = dash.Dash(__name__, external_stylesheets=[dbc.themes.BOOTSTRAP])
 
-    return decision, {
-        "RSI": round(rsi, 1),
-        "MACD": round(macd, 2),
-        "MACD_SIGNAL": round(signal, 2),
-        "EMA50": round(ema50, 2),
-        "EMA200": round(ema200, 2)
-    }
+app.layout = dbc.Container([
+    html.H2("Dashboard Investimenti e Liquidità Altcoin"),
+    html.Hr(),
 
-# === LAYOUT ===
-app.layout = html.Div([
-    html.H2("📈 Altcoin Signal Dashboard", style={'textAlign': 'center'}),
-
+    # Upload file Excel
     dcc.Upload(
         id='upload-data',
-        children=html.Div(['📤 Trascina qui il file Excel o clicca per caricare']),
+        children=html.Div([
+            'Trascina o ',
+            html.A('seleziona un file Excel (.xlsx)')
+        ]),
         style={
-            'width': '90%',
-            'height': '60px',
-            'lineHeight': '60px',
-            'borderWidth': '1px',
-            'borderStyle': 'dashed',
-            'borderRadius': '5px',
-            'textAlign': 'center',
-            'margin': 'auto'
+            'width': '100%', 'height': '60px', 'lineHeight': '60px',
+            'borderWidth': '1px', 'borderStyle': 'dashed',
+            'borderRadius': '5px', 'textAlign': 'center', 'margin-bottom': '15px',
         },
-        multiple=False
+        multiple=False,
+        accept='.xlsx'
     ),
-    html.Div(id='upload-status'),
-    html.Br(),
 
-    html.Button('Aggiorna manualmente', id='btn-update', n_clicks=0,
-                style={'margin': '10px auto', 'display': 'block'}),
+    dbc.Button("Aggiorna dati manualmente", id="refresh-button", color="primary", className="mb-3"),
 
-    html.Div(id='liquidity-info'),
-    dcc.Interval(id='interval', interval=5*60*1000, n_intervals=0),
-    html.Div(id='signals-table')
-])
+    html.Div(id="upload-status", style={"color": "green", "margin-bottom": "10px"}),
 
-# === CALLBACK: Upload ===
+    # Tabella con dati e segnali
+    dash_table.DataTable(
+        id='table-assets',
+        columns=[
+            {"name": "Symbol", "id": "Symbol"},
+            {"name": "Valore (USD)", "id": "Valore", "type": "numeric", "format": {"specifier": ".2f"}},
+            {"name": "Liquidità (USDT)", "id": "Liquidità_USDT", "type": "numeric", "format": {"specifier": ".2f"}},
+            {"name": "Liquidità (AED)", "id": "Liquidità_AED", "type": "numeric", "format": {"specifier": ".2f"}},
+            {"name": "Segnale", "id": "Segnale"},
+        ],
+        style_cell={'textAlign': 'center'},
+        style_header={'fontWeight': 'bold'},
+        style_data_conditional=[
+            {
+                'if': {'filter_query': '{Segnale} = "BUY"'},
+                'backgroundColor': '#d4edda',
+                'color': '#155724'
+            },
+            {
+                'if': {'filter_query': '{Segnale} = "SELL"'},
+                'backgroundColor': '#f8d7da',
+                'color': '#721c24'
+            },
+            {
+                'if': {'filter_query': '{Segnale} = "HOLD"'},
+                'backgroundColor': '#fff3cd',
+                'color': '#856404'
+            },
+        ]
+    ),
+
+    dcc.Interval(id='interval-refresh', interval=60*1000, n_intervals=0)  # refresh ogni 60s
+], fluid=True)
+
+
 @app.callback(
     Output('upload-status', 'children'),
+    Output('table-assets', 'data'),
     Input('upload-data', 'contents'),
-    State('upload-data', 'filename')
+    State('upload-data', 'filename'),
+    Input('refresh-button', 'n_clicks'),
+    Input('interval-refresh', 'n_intervals'),
+    prevent_initial_call=True
 )
-def save_uploaded_file(contents, filename):
-    if contents is not None:
+def update_output(contents, filename, refresh_clicks, n_intervals):
+    ctx = callback_context
+    triggered_id = ctx.triggered[0]['prop_id'].split('.')[0] if ctx.triggered else None
+
+    # Se caricamento file
+    if triggered_id == 'upload-data' and contents is not None:
         content_type, content_string = contents.split(',')
-        decoded = base64.b64decode(content_string)
-        with open(EXCEL_FILE, 'wb') as f:
-            f.write(decoded)
-        return html.Div(f"✅ File '{filename}' caricato correttamente.")
-    return ""
+        import base64
+        import io
 
-# === CALLBACK: Liquidity ===
-@app.callback(
-    Output('liquidity-info', 'children'),
-    Input('interval', 'n_intervals'),
-    Input('btn-update', 'n_clicks')
-)
-def update_liquidity(n_intervals, n_clicks):
-    _, usdt, aed = load_assets()
-    if usdt and aed:
-        return html.H4(f"💰 Liquidità: {usdt} USDT | {aed} AED", style={'textAlign': 'center'})
-    else:
-        return html.H4("⚠️ Liquidità non disponibile nel file.", style={'textAlign': 'center', 'color': 'red'})
+        try:
+            decoded = base64.b64decode(content_string)
+            # Salva il file caricato in data/assets.xlsx
+            with open(EXCEL_FILE, 'wb') as f:
+                f.write(decoded)
+            df = load_assets()
+            if df.empty:
+                return "File caricato, ma dati non validi o vuoti.", []
+            # Calcola segnale
+            df['Segnale'] = df['Valore'].apply(signal_from_valore)
+            return f"File '{filename}' caricato con successo.", df.to_dict('records')
+        except Exception as e:
+            return f"Errore nel caricamento file: {e}", []
 
-# === CALLBACK: Signals Table ===
-@app.callback(
-    Output('signals-table', 'children'),
-    Input('interval', 'n_intervals'),
-    Input('btn-update', 'n_clicks')
-)
-def update_signals(n_intervals, n_clicks):
-    asset_df, _, _ = load_assets()
-    rows = []
+    # Se refresh manuale o automatico
+    elif triggered_id in ['refresh-button', 'interval-refresh']:
+        df = load_assets()
+        if df.empty:
+            return "Errore nel caricamento dati da file.", []
+        df['Segnale'] = df['Valore'].apply(signal_from_valore)
+        return "Dati aggiornati.", df.to_dict('records')
 
-    for _, row in asset_df.iterrows():
-        symbol = row['Symbol']
-        valore = row['Valore']
-        df = get_indicators(symbol)
-        signal, indicators = generate_signal(df)
+    return dash.no_update
 
-        if indicators:
-            row_el = html.Tr([
-                html.Td(symbol),
-                html.Td(f"${valore:,.2f}"),
-                html.Td(indicators['RSI']),
-                html.Td(indicators['MACD']),
-                html.Td(indicators['MACD_SIGNAL']),
-                html.Td(f"{indicators['EMA50']} / {indicators['EMA200']}"),
-                html.Td(signal, style={'color': 'green' if signal == 'BUY' else 'red' if signal == 'SELL' else 'gray'})
-            ])
-        else:
-            row_el = html.Tr([html.Td(symbol), html.Td(f"${valore:,.2f}"), html.Td("No data", colSpan=5)])
-        rows.append(row_el)
 
-    return html.Table([
-        html.Thead(html.Tr([
-            html.Th("Symbol"),
-            html.Th("Valore"),
-            html.Th("RSI"),
-            html.Th("MACD"),
-            html.Th("MACD Signal"),
-            html.Th("EMA50/200"),
-            html.Th("Segnale")
-        ])),
-        html.Tbody(rows)
-    ], style={'width': '100%', 'textAlign': 'center', 'marginTop': '20px'})
-
-# === RUN ===
-if __name__ == "__main__":
-    app.run(debug=False, host="0.0.0.0", port=8080)
+if __name__ == '__main__':
+    app.run_server(debug=False, host='0.0.0.0', port=8080)
